@@ -1,5 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import "server-only";
+import { tavily } from "@tavily/core";
+import Firecrawl from "@mendable/firecrawl-js";
 import { env } from "@/lib/env";
 import { logger, logError, startSpan } from "@/lib/logger";
 
@@ -9,7 +11,7 @@ export type SearchResult = {
   snippet?: string;
   score?: number;
   publishedAt?: string | null;
-  source?: "jina";
+  source?: "jina"; // keep literal for downstream compatibility
 };
 
 export type DeepsearchOptions = {
@@ -19,9 +21,36 @@ export type DeepsearchOptions = {
   disallowedDomains?: string[];
   region?: string;
   abortSignal?: AbortSignal;
-  timeoutMs?: number;
-  prewarm?: boolean; // NEW: hit s.jina.ai first to warm caches
+  timeoutMs?: number; // default ~45s
+  chatTimeoutMs?: number; // kept for compat (unused)
+  prewarm?: boolean; // no-op here
+  disableChatFallback?: boolean; // no-op here
 };
+
+// Defaults
+const DEFAULT_SEARCH_TIMEOUT = Math.max(10_000, env.REQUEST_TIMEOUT_MS ?? 45_000);
+
+/* ------------------------------- Singletons -------------------------------- */
+
+let tvlyClient: ReturnType<typeof tavily> | null = null;
+function getTavily() {
+  if (tvlyClient) return tvlyClient;
+  const apiKey = process.env.TAVILY_API_KEY || "";
+  if (!apiKey) return null;
+  tvlyClient = tavily({ apiKey });
+  return tvlyClient;
+}
+
+let firecrawlClient: Firecrawl | null = null;
+function getFirecrawl(): Firecrawl | null {
+  if (firecrawlClient) return firecrawlClient;
+  const apiKey = process.env.FIRECRAWL_API_KEY || "";
+  if (!apiKey) return null;
+  firecrawlClient = new Firecrawl({ apiKey });
+  return firecrawlClient;
+}
+
+/* --------------------------------- Entry ----------------------------------- */
 
 export async function deepsearch(
   query: string,
@@ -31,45 +60,49 @@ export async function deepsearch(
   const span = startSpan(log, "deepsearch");
   if (!query || !query.trim()) return [];
 
-  const f = await getFetch();
-  const useChat = process.env.JINA_USE_CHAT === "1";
-  const doPrewarm = opts.prewarm ?? process.env.JINA_PREWARM === "1";
-  const timeout = opts.timeoutMs ?? env.REQUEST_TIMEOUT_MS;
+  const searchTimeout = opts.timeoutMs ?? DEFAULT_SEARCH_TIMEOUT;
 
   try {
-    // Optional prewarm to s.jina.ai (no response body)
-    if (doPrewarm) {
-      await prewarmJina(query, timeout, f).catch((e) => {
-        logError(log, e, "prewarm failed (non-fatal)");
-      });
+    // 1) Tavily primary
+    const primary = await tavilySearch(query, opts, searchTimeout, {
+      widen: false,
+      relax: false,
+    });
+    if (primary.items.length > 0) {
+      span.end({ count: primary.items.length, via: "tavily", prewarm: false });
+      return primary.items;
     }
 
-    if (useChat) {
-      const res = await deepsearchChat(query, opts, timeout, f);
-      span.end({ count: res.length, via: "chat", prewarm: doPrewarm });
-      return res;
-    }
-
-    const res = await deepsearchSearchApi(query, opts, timeout, f);
-    if (res.kind === "ok") {
-      span.end({ count: res.items.length, via: "search", prewarm: doPrewarm });
-      return res.items;
-    }
-
-    if (res.nonRetryable) {
-      const chat = await deepsearchChat(query, opts, timeout, f).catch((e) => {
-        logError(log, e, "chat fallback failed");
-        return [] as SearchResult[];
-      });
+    // 2) Broaden-and-retry Tavily
+    const relaxedQuery = loosenQuery(query);
+    const broadened = await tavilySearch(relaxedQuery || query, opts, searchTimeout, {
+      widen: true,
+      relax: true,
+    });
+    if (broadened.items.length > 0) {
       span.end({
-        count: chat.length,
-        via: "chat-fallback",
-        prewarm: doPrewarm,
+        count: broadened.items.length,
+        via: "tavily-broadened",
+        prewarm: false,
       });
-      return chat;
+      return broadened.items;
     }
 
-    span.end({ count: 0, error: true, via: "search", prewarm: doPrewarm });
+    // 3) Firecrawl fallback (if key present)
+    const hasFirecrawl = !!process.env.FIRECRAWL_API_KEY;
+    if (hasFirecrawl) {
+      const f = await firecrawlSearch(relaxedQuery || query, opts, searchTimeout);
+      if (f.length > 0) {
+        span.end({
+          count: f.length,
+          via: "firecrawl-fallback",
+          prewarm: false,
+        });
+        return f;
+      }
+    }
+
+    span.end({ count: 0, via: "tavily-empty", error: true, prewarm: false });
     return [];
   } catch (e) {
     logError(log, e, "deepsearch failed", { query });
@@ -77,6 +110,8 @@ export async function deepsearch(
     return [];
   }
 }
+
+/* -------------------------------- Batch ------------------------------------ */
 
 export async function deepsearchBatch(
   queries: string[],
@@ -87,320 +122,277 @@ export async function deepsearchBatch(
   return dedupeResults(all.flat());
 }
 
-/* -------------------------------- Search API ------------------------------- */
+/* ------------------------------ Tavily SDK --------------------------------- */
 
-async function deepsearchSearchApi(
+type TavilySearchDepth = "basic" | "advanced";
+type TavilyTopic = "general" | "news" | "finance";
+
+async function tavilySearch(
   query: string,
   opts: DeepsearchOptions,
   timeoutMs: number,
-  f: typeof fetch
-): Promise<
-  { kind: "ok"; items: SearchResult[] } | { kind: "err"; nonRetryable: boolean }
-> {
-  const base = (env.JINA_SEARCH_BASE || "https://api.jina.ai").replace(
-    /\/+$/,
-    ""
+  behavior: { widen: boolean; relax: boolean }
+): Promise<{ items: SearchResult[]; reason?: string }> {
+  const client = getTavily();
+  if (!client) return { items: [], reason: "missing_tavily_key" };
+
+  const baseTopK = Math.max(1, Math.min(50, opts.size ?? 8));
+  const max_results = behavior.widen ? Math.max(8, Math.min(20, baseTopK + 4)) : baseTopK;
+
+  // Depth & topic
+  const search_depth =
+    ((process.env.TAVILY_SEARCH_DEPTH as TavilySearchDepth) || "advanced") as TavilySearchDepth;
+
+  // Don’t force 'news' automatically; leave to env override
+  const topic = ((process.env.TAVILY_TOPIC as TavilyTopic) || "general") as TavilyTopic;
+
+  // Optional country boost (exact string name per docs); avoid mapping region automatically
+  const country = process.env.TAVILY_COUNTRY || undefined;
+
+  // Time constraints: prefer exact start/end; else coarse time_range
+  const start_date = toISODate(opts.timeRange?.from);
+  const end_date = toISODate(opts.timeRange?.to);
+  const time_range = !start_date && !end_date ? toTavilyTimeRange(opts.timeRange) : undefined;
+
+  // Domains (relaxed when broadening)
+  const include_domains =
+    behavior.relax ? undefined : (opts.allowedDomains?.length ? opts.allowedDomains : undefined);
+  const exclude_domains =
+    behavior.relax
+      ? undefined
+      : (opts.disallowedDomains?.length ? opts.disallowedDomains : undefined);
+
+  // Optional: auto_parameters (costs more credits)
+  const auto_params = ["1", "true", "yes"].includes(
+    String(process.env.TAVILY_AUTO_PARAMETERS || "").toLowerCase()
   );
-  const url = `${base}/v1/search`;
-
-  const topK = Math.max(1, Math.min(50, opts.size ?? 8));
-  const payload: Record<string, unknown> = {
-    query,
-    top_k: topK,
-    allow: opts.allowedDomains?.length ? opts.allowedDomains : undefined,
-    deny: opts.disallowedDomains?.length ? opts.disallowedDomains : undefined,
-    time_range: normalizeTimeRange(opts.timeRange),
-    region: opts.region,
-    use_cache: true,
-  };
-
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Accept: "application/json",
-  };
-  if (env.JINA_API_KEY) headers.Authorization = `Bearer ${env.JINA_API_KEY}`;
-
-  const { signal, cancel } = timeoutSignal(timeoutMs, opts.abortSignal);
 
   try {
-    const maxRetries = 2;
-    const baseDelay = 400;
-
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      const r = await f(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(stripUndefined(payload)),
-        signal,
-        cache: "no-store" as any,
-      });
-
-      if (r.status === 404 || r.status === 401 || r.status === 400) {
-        return { kind: "err", nonRetryable: true };
+    const resp = await client.search(
+      {
+        query,
+        max_results,
+        search_depth,
+        topic,
+        include_answer: false,
+        include_raw_content: false,
+        include_images: false,
+        include_favicon: false,
+        ...(auto_params ? { auto_parameters: true } : {}),
+        ...(include_domains ? { include_domains } : {}),
+        ...(exclude_domains ? { exclude_domains } : {}),
+        ...(time_range ? { time_range } : {}),
+        ...(start_date ? { start_date } : {}),
+        ...(end_date ? { end_date } : {}),
+        ...(country ? { country } : {}),
+      } as any,
+      {
+        timeoutInSeconds: Math.max(1, Math.floor(timeoutMs / 1000)),
+        abortSignal: opts.abortSignal,
       }
-      if (!r.ok) {
-        const retryable = r.status === 429 || r.status >= 500;
-        if (retryable && attempt < maxRetries) {
-          await sleep(baseDelay * Math.pow(2, attempt), signal);
-          continue;
-        }
-        const text = await safeText(r);
-        throw new Error(`Jina search HTTP ${r.status}: ${text?.slice(0, 300)}`);
-      }
-
-      const json = await r.json();
-      const items = normalizeJinaResponse(json);
-      const filtered = postFilter(items, {
-        allowed: opts.allowedDomains,
-        disallowed: opts.disallowedDomains,
-      });
-      return { kind: "ok", items: dedupeResults(filtered) };
-    }
-
-    return { kind: "err", nonRetryable: false };
-  } finally {
-    cancel();
-  }
-}
-
-/* ------------------------- Deepsearch Chat Completions --------------------- */
-
-async function deepsearchChat(
-  query: string,
-  opts: DeepsearchOptions,
-  timeoutMs: number,
-  f: typeof fetch
-): Promise<SearchResult[]> {
-  const base = "https://deepsearch.jina.ai";
-  const url = `${base.replace(/\/+$/, "")}/v1/chat/completions`;
-
-  const topK = Math.max(1, Math.min(30, opts.size ?? 8));
-  const sys = [
-    "You are a search assistant.",
-    "Return a JSON array of search results ONLY. No prose, no code fences.",
-    'Each item: { "url": string, "title"?: string, "snippet"?: string }',
-    "Prefer high-quality, diverse, recent sources. Do not invent URLs.",
-  ].join(" ");
-
-  const userParts: string[] = [];
-  userParts.push(`Query: ${query}`);
-  userParts.push(`TopK: ${topK}`);
-  if (opts.timeRange?.from || opts.timeRange?.to)
-    userParts.push(
-      `TimeRange: from=${opts.timeRange?.from ?? ""} to=${
-        opts.timeRange?.to ?? ""
-      }`
     );
-  if (opts.allowedDomains?.length)
-    userParts.push(`Allow: ${opts.allowedDomains.join(", ")}`);
-  if (opts.disallowedDomains?.length)
-    userParts.push(`Deny: ${opts.disallowedDomains.join(", ")}`);
-  if (opts.region) userParts.push(`Region: ${opts.region}`);
 
-  const payload = {
-    model: "jina-deepsearch-v1",
-    stream: false,
-    reasoning_effort: "medium",
-    messages: [
-      { role: "system", content: sys },
-      { role: "user", content: userParts.join("\n") },
-    ],
-  };
+    const results = Array.isArray((resp as any)?.results) ? (resp as any).results : [];
+    const mapped: SearchResult[] = results
+      .map((it: any) => {
+        const url = typeof it?.url === "string" ? it.url : undefined;
+        if (!url) return null;
+        const canon = canonicalizeUrl(url);
+        if (!canon) return null;
+        const title =
+          typeof it?.title === "string"
+            ? it.title
+            : typeof it?.name === "string"
+            ? it.name
+            : undefined;
+        const snippet =
+          typeof it?.content === "string"
+            ? it.content
+            : typeof it?.description === "string"
+            ? it.description
+            : undefined;
+        const published =
+          typeof it?.published_date === "string"
+            ? it.published_date
+            : typeof it?.published_time === "string"
+            ? it.published_time
+            : typeof it?.date === "string"
+            ? it.date
+            : null;
 
-  const { signal, cancel } = timeoutSignal(timeoutMs, opts.abortSignal);
-  try {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-    if (env.JINA_API_KEY) headers.Authorization = `Bearer ${env.JINA_API_KEY}`;
+        return {
+          url: canon,
+          title,
+          snippet,
+          score: undefined,
+          publishedAt: published,
+          source: "jina",
+        } satisfies SearchResult;
+      })
+      .filter(Boolean) as SearchResult[];
 
-    const r = await f(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-      signal,
-      cache: "no-store" as any,
+    const filtered = postFilter(mapped, {
+      allowed: behavior.relax ? undefined : opts.allowedDomains,
+      disallowed: behavior.relax ? undefined : opts.disallowedDomains,
     });
 
-    if (r.status === 404 || r.status === 401 || r.status === 400) return [];
-    if (!r.ok) {
-      const text = await safeText(r);
-      throw new Error(
-        `Jina deepsearch chat HTTP ${r.status}: ${text?.slice(0, 300)}`
-      );
-    }
-
-    const json = await r.json();
-    const text = extractTextFromChat(json);
-    const parsed = tryParseResultsJSON(text);
-    if (parsed.length) return normalizeRawResults(parsed);
-
-    const urls = extractUrls(text);
-    return normalizeRawResults(urls.map((u) => ({ url: u })));
-  } finally {
-    cancel();
+    return { items: dedupeResults(filtered) };
+  } catch (e: any) {
+    // Tavily SDK throws on non-2xx; treat as no results so fallback can run
+    return { items: [], reason: String(e?.message || "tavily_error") };
   }
 }
 
-/* ------------------------------ Jina Prewarm ------------------------------- */
+/* --------------------------- Firecrawl Search SDK -------------------------- */
 
-async function prewarmJina(
+async function firecrawlSearch(
   query: string,
-  timeoutMs: number,
-  f: typeof fetch
-): Promise<void> {
-  const base = "https://s.jina.ai";
-  const url = `${base}/?q=${encodeURIComponent(query)}`;
+  opts: DeepsearchOptions,
+  timeoutMs: number
+): Promise<SearchResult[]> {
+  const client = getFirecrawl();
+  if (!client) return [];
 
-  const headers: Record<string, string> = {
-    "X-Respond-With": "no-content",
-  };
-  if (env.JINA_API_KEY) headers.Authorization = `Bearer ${env.JINA_API_KEY}`;
+  // Compute limit
+  const topK = Math.max(1, Math.min(20, opts.size ?? 8));
 
-  const { signal, cancel } = timeoutSignal(timeoutMs);
+  // Optional country/location
+  const location = process.env.FIRECRAWL_COUNTRY;
+
+  // Time window → tbs
+  const tbs = toFirecrawlTbs(opts.timeRange);
+
   try {
-    await f(url, {
-      method: "GET",
-      headers,
-      signal,
-      cache: "no-store" as any,
-    }).catch(() => undefined);
-  } finally {
-    cancel();
-  }
-}
+    const resp: any = await client.search(query, {
+      limit: topK,
+      ...(location ? { location } : {}),
+      ...(tbs ? { tbs } : {}),
+      // We are NOT scraping content here to keep it cheap and fast
+      // scrapeOptions: { formats: ['markdown'] }
+      timeout: Math.max(1, Math.floor(timeoutMs)), // ms
+    });
 
-/* ------------------------------- Parsing utils ----------------------------- */
+    // SDK returns a data object. Gather URLs from web/news arrays if present.
+    const data = resp?.data ?? resp ?? {};
+    const web: any[] = Array.isArray(data.web) ? data.web : [];
+    const news: any[] = Array.isArray(data.news) ? data.news : [];
+    // Sometimes SDK returns an array directly when scraping content; guard:
+    const flat: any[] = Array.isArray(data) ? data : [];
 
-function extractTextFromChat(json: any): string {
-  const choices = json?.choices;
-  if (Array.isArray(choices) && choices.length > 0) {
-    const msg = choices[0]?.message?.content;
-    if (typeof msg === "string" && msg.trim()) return msg;
-    if (Array.isArray(msg)) {
-      const t = msg
-        .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
-        .join("\n");
-      if (t.trim()) return t;
-    }
-  }
-  return "";
-}
+    const rows = [...web, ...news, ...flat].slice(0, topK);
 
-function tryParseResultsJSON(
-  text: string
-): Array<{ url: string; title?: string; snippet?: string }> {
-  const t = text.trim();
-  if (!t) return [];
-  const start = t.indexOf("[");
-  const end = t.lastIndexOf("]");
-  if (start === -1 || end === -1 || end <= start) return [];
-  try {
-    const arr = JSON.parse(t.slice(start, end + 1));
-    if (Array.isArray(arr)) {
-      return arr
-        .filter((x) => x && typeof x.url === "string")
-        .map((x) => ({
-          url: String(x.url),
-          title: typeof x.title === "string" ? x.title : undefined,
-          snippet: typeof x.snippet === "string" ? x.snippet : undefined,
-        }));
-    }
+    const mapped: SearchResult[] = rows
+      .map((it: any) => {
+        const url = typeof it?.url === "string" ? it.url : undefined;
+        if (!url) return null;
+        const canon = canonicalizeUrl(url);
+        if (!canon) return null;
+        const title = typeof it?.title === "string" ? it.title : undefined;
+        const snippet =
+          typeof it?.description === "string"
+            ? it.description
+            : typeof it?.snippet === "string"
+            ? it.snippet
+            : undefined;
+        return { url: canon, title, snippet, source: "jina" } as SearchResult;
+      })
+      .filter(Boolean) as SearchResult[];
+
+    const filtered = postFilter(mapped, {
+      allowed: opts.allowedDomains,
+      disallowed: opts.disallowedDomains,
+    });
+
+    return dedupeResults(filtered).slice(0, topK);
   } catch {
     return [];
   }
-  return [];
 }
 
-function extractUrls(text: string): string[] {
-  const re = /\bhttps?:\/\/[^\s)]+/gi;
-  const out: string[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text))) out.push(m[0]);
-  return Array.from(new Set(out));
+/* ------------------------------ Helpers/utils ------------------------------ */
+
+// Loosen query (remove quotes/parentheses and collapse whitespace)
+function loosenQuery(q: string): string {
+  return (q || "")
+    .replace(/[“”"']/g, " ")
+    .replace(/[()]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-function normalizeRawResults(
-  raw: Array<{ url: string; title?: string; snippet?: string }>
-): SearchResult[] {
-  const out: SearchResult[] = [];
-  for (const it of raw) {
-    const canon = canonicalizeUrl(it.url);
-    if (!canon) continue;
-    out.push({
-      url: canon,
-      title: it.title,
-      snippet: it.snippet,
-      source: "jina",
-    });
+function toISODate(x?: string) {
+  if (!x) return undefined;
+  const d = new Date(x);
+  if (Number.isNaN(d.getTime())) return undefined;
+  return d.toISOString().slice(0, 10);
+}
+
+// Tavily coarse time_range mapper
+function toTavilyTimeRange(
+  tr?: { from?: string; to?: string }
+): "day" | "week" | "month" | "year" | undefined {
+  const norm = normalizeTimeRange(tr);
+  if (!norm?.from && !norm?.to) return undefined;
+  try {
+    const from = norm.from ? new Date(norm.from) : undefined;
+    const to = norm.to ? new Date(norm.to) : new Date();
+    const ms = (to?.getTime() ?? Date.now()) - (from?.getTime() ?? Date.now());
+    const days = Math.max(1, Math.round(ms / (24 * 3600 * 1000)));
+    if (days <= 7) return "week";
+    if (days <= 31) return "month";
+    return "year";
+  } catch {
+    return undefined;
   }
-  return dedupeResults(out);
+}
+
+// Firecrawl tbs (time-based search): qdr:h/d/w/m/y or custom ranges
+function toFirecrawlTbs(tr?: { from?: string; to?: string }): string | undefined {
+  const norm = normalizeTimeRange(tr);
+  if (!norm?.from && !norm?.to) return undefined;
+  // If from is within last day/week/month/year choose qdr; otherwise custom CDR
+  try {
+    const from = norm.from ? new Date(norm.from) : undefined;
+    const to = norm.to ? new Date(norm.to) : new Date();
+    const ms = (to?.getTime() ?? Date.now()) - (from?.getTime() ?? Date.now());
+    const days = Math.max(1, Math.round(ms / (24 * 3600 * 1000)));
+    if (days <= 1) return "qdr:d";
+    if (days <= 7) return "qdr:w";
+    if (days <= 31) return "qdr:m";
+    if (days <= 365) return "qdr:y";
+    // Custom date range (US format per docs)
+    const cdMin = from ? toUsDate(from) : undefined;
+    const cdMax = to ? toUsDate(to) : undefined;
+    if (cdMin || cdMax) {
+      return `cdr:1${cdMin ? `,cd_min:${cdMin}` : ""}${cdMax ? `,cd_max:${cdMax}` : ""}`;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function toUsDate(d: Date): string {
+  const mm = String(d.getMonth() + 1).padStart(1, "0");
+  const dd = String(d.getDate()).padStart(1, "0");
+  const yyyy = d.getFullYear();
+  return `${mm}/${dd}/${yyyy}`;
+}
+
+function normalizeTimeRange(tr?: { from?: string; to?: string }) {
+  if (!tr) return undefined;
+  const from = isoOrUndefined(tr.from);
+  const to = isoOrUndefined(tr.to);
+  if (!from && !to) return undefined;
+  return { from, to };
+}
+function isoOrUndefined(x?: string) {
+  if (!x) return undefined;
+  const d = new Date(x);
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString().slice(0, 10);
 }
 
 /* -------------------------------- Shared utils ----------------------------- */
-
-type JinaRawItem = {
-  url?: string;
-  link?: string;
-  title?: string;
-  snippet?: string;
-  score?: number | string;
-  relevance_score?: number | string;
-  published_time?: string;
-  publishedAt?: string;
-  date?: string;
-  [k: string]: unknown;
-};
-
-function normalizeJinaResponse(json: any): SearchResult[] {
-  const arr: JinaRawItem[] = Array.isArray(json)
-    ? json
-    : Array.isArray(json?.results)
-    ? json.results
-    : Array.isArray(json?.data)
-    ? json.data
-    : Array.isArray(json?.output)
-    ? json.output
-    : [];
-
-  const out: SearchResult[] = [];
-  for (const it of arr) {
-    const rawUrl = it.url || (it as any).link;
-    if (!rawUrl || typeof rawUrl !== "string") continue;
-
-    const canon = canonicalizeUrl(rawUrl);
-    if (!canon) continue;
-
-    const rawScore =
-      typeof it.score === "number"
-        ? it.score
-        : typeof it.score === "string"
-        ? Number(it.score)
-        : typeof it.relevance_score === "number"
-        ? it.relevance_score
-        : typeof it.relevance_score === "string"
-        ? Number(it.relevance_score)
-        : undefined;
-
-    const publishedAt =
-      (typeof it.published_time === "string" && it.published_time) ||
-      (typeof it.publishedAt === "string" && it.publishedAt) ||
-      (typeof it.date === "string" && it.date) ||
-      null;
-
-    out.push({
-      url: canon,
-      title: typeof it.title === "string" ? it.title : undefined,
-      snippet: typeof it.snippet === "string" ? it.snippet : undefined,
-      score: Number.isFinite(rawScore as number)
-        ? (rawScore as number)
-        : undefined,
-      publishedAt,
-      source: "jina",
-    });
-  }
-  return out;
-}
 
 function postFilter(
   items: SearchResult[],
@@ -415,15 +407,9 @@ function postFilter(
     } catch {
       return false;
     }
-    if (
-      allowed.length > 0 &&
-      !allowed.some((d) => host === d || host.endsWith("." + d))
-    )
+    if (allowed.length > 0 && !allowed.some((d) => host === d || host.endsWith("." + d)))
       return false;
-    if (
-      disallowed.length > 0 &&
-      disallowed.some((d) => host === d || host.endsWith("." + d))
-    )
+    if (disallowed.length > 0 && disallowed.some((d) => host === d || host.endsWith("." + d)))
       return false;
     return true;
   });
@@ -445,10 +431,7 @@ function normDomains(xs: string[]): string[] {
   const out: string[] = [];
   for (const x of xs) {
     if (!x) continue;
-    const h = x
-      .replace(/^https?:\/\//i, "")
-      .split("/")[0]
-      .toLowerCase();
+    const h = x.replace(/^https?:\/\//i, "").split("/")[0].toLowerCase();
     if (h) out.push(h);
   }
   return out;
@@ -489,75 +472,7 @@ function canonicalizeUrl(u: string): string | null {
   }
 }
 
-function normalizeTimeRange(tr?: { from?: string; to?: string }) {
-  if (!tr) return undefined;
-  const from = isoOrUndefined(tr.from);
-  const to = isoOrUndefined(tr.to);
-  if (!from && !to) return undefined;
-  return { from, to };
-}
-
-function isoOrUndefined(x?: string) {
-  if (!x) return undefined;
-  const d = new Date(x);
-  return Number.isNaN(d.getTime()) ? undefined : d.toISOString().slice(0, 10);
-}
-
-function stripUndefined<T extends Record<string, unknown>>(obj: T): T {
-  const out: Record<string, unknown> = {};
-  Object.keys(obj).forEach((k) => {
-    const v = (obj as any)[k];
-    if (v !== undefined) out[k] = v;
-  });
-  return out as T;
-}
-
-/* ------------------------------ Timing/Fetch ------------------------------- */
-
-function timeoutSignal(timeoutMs: number, ext?: AbortSignal) {
-  const ac = new AbortController();
-  const timer = setTimeout(
-    () => ac.abort(new DOMException("Timeout", "TimeoutError")),
-    timeoutMs
-  );
-  const onAbort = () =>
-    ac.abort(ext?.reason ?? new DOMException("Aborted", "AbortError"));
-  if (ext) {
-    if (ext.aborted) onAbort();
-    else ext.addEventListener("abort", onAbort, { once: true });
-  }
-  return { signal: ac.signal, cancel: () => clearTimeout(timer) };
-}
-
-async function safeText(res: Response): Promise<string | null> {
-  try {
-    return await res.text();
-  } catch {
-    return null;
-  }
-}
-
-async function getFetch(): Promise<typeof fetch> {
-  if (typeof fetch !== "undefined") return fetch;
-  const mod = (await import("node-fetch")) as any;
-  return (mod.default ?? mod) as typeof fetch;
-}
-
-/* -------------------------------- mapLimit util ---------------------------- */
-
-async function sleep(ms: number, signal?: AbortSignal) {
-  return new Promise<void>((resolve, reject) => {
-    const t = setTimeout(resolve, ms);
-    if (signal) {
-      const onAbort = () => {
-        clearTimeout(t);
-        reject(signal.reason ?? new Error("Aborted"));
-      };
-      if (signal.aborted) onAbort();
-      else signal.addEventListener("abort", onAbort, { once: true });
-    }
-  });
-}
+/* --------------------------------- Timing ---------------------------------- */
 
 async function mapLimit<T, R>(
   arr: readonly T[],

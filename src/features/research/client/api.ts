@@ -26,7 +26,7 @@ export type StreamOptions = {
   endpoint?: string; // default '/api/research'
   headers?: HeadersInit; // extra headers
   abortSignal?: AbortSignal; // external abort
-  connectTimeoutMs?: number; // default 15000 (fail if no first bytes)
+  connectTimeoutMs?: number; // default 45000 (time to response headers)
   idleTimeoutMs?: number; // default 60000 (abort on no events)
   onEvent?: (msg: ResearchSSEMessage) => void; // per-event callback
 };
@@ -53,8 +53,9 @@ export function streamResearch(
   }
 
   const endpoint = opts.endpoint ?? "/api/research";
-  const connectTimeoutMs = Math.max(1000, opts.connectTimeoutMs ?? 15000);
-  const idleTimeoutMs = Math.max(5000, opts.idleTimeoutMs ?? 60000);
+  // Increased default: some runs take >15s to start streaming
+  const connectTimeoutMs = Math.max(1000, opts.connectTimeoutMs ?? 45_000);
+  const idleTimeoutMs = Math.max(5000, opts.idleTimeoutMs ?? 60_000);
 
   const ac = new AbortController();
   const controller = ac;
@@ -72,13 +73,12 @@ export function streamResearch(
     }
   }
 
-  let lastEventTs = Date.now();
+  // "connected" now means "we have response headers"
   let connected = false;
   let connectTimer: ReturnType<typeof setTimeout> | null = null;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
   const resetIdle = () => {
-    lastEventTs = Date.now();
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       tryAbort(ac, new DOMException("Idle timeout", "AbortError"));
@@ -86,29 +86,38 @@ export function streamResearch(
   };
 
   const onEvent = (msg: ResearchSSEMessage) => {
-    connected = true;
     resetIdle();
     opts.onEvent?.(msg);
   };
 
   const done = (async () => {
     try {
-      // Connection watchdog (no first bytes)
+      // Watchdog for time-to-response-headers
       connectTimer = setTimeout(() => {
-        if (!connected)
-          tryAbort(ac, new DOMException("Connect timeout", "AbortError"));
+        if (!connected) {
+          tryAbort(ac, new DOMException("Connect timeout (headers)", "AbortError"));
+        }
       }, connectTimeoutMs);
 
       const res = await fetch(endpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          // Hint to the server that we expect SSE
+          Accept: "text/event-stream",
           ...(opts.headers ?? {}),
         },
         body: JSON.stringify(parsed.data),
         signal: ac.signal,
         cache: "no-store",
       });
+
+      // We have response headers → clear connect watchdog and mark connected
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+      connected = true;
 
       if (!res.ok) {
         const text = await safeText(res);
@@ -135,21 +144,15 @@ export function streamResearch(
       const dec = new TextDecoder();
       const sse = createSSEDecoder();
 
+      // Start idle timer; it resets as events arrive
       resetIdle();
 
       // Read loop
-
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
 
         if (value) {
-          if (!connected) connected = true;
-          if (connectTimer) {
-            clearTimeout(connectTimer);
-            connectTimer = null;
-          }
-
           const chunk = dec.decode(value, { stream: true });
           const events = sse.push(chunk);
 
@@ -167,9 +170,7 @@ export function streamResearch(
         if (msg) onEvent(msg);
       }
     } catch (err: any) {
-      if (err?.name === "AbortError") {
-        // Swallow abort errors (caller initiated or timeout)
-      } else {
+      if (err?.name !== "AbortError") {
         onEvent({
           event: "error",
           data: { message: String(err?.message ?? err) },

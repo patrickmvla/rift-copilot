@@ -2,6 +2,7 @@
 import { client } from "@/db";
 import { env } from "@/lib/env";
 import { logger, startSpan, logError } from "@/lib/logger";
+import { VoyageAIClient, VoyageAIError } from "voyageai";
 
 export type RankedChunk = {
   id: string;
@@ -49,16 +50,16 @@ export async function rankForQueries(
   );
 
   const useRerank =
-    (opts.enableRerank ?? env.ENABLE_RERANK) && !!env.JINA_API_KEY;
-  let perQueryRanked: RankedChunk[][];
+    (opts.enableRerank ?? env.ENABLE_RERANK) && !!process.env.VOYAGE_API_KEY;
 
+  let perQueryRanked: RankedChunk[][];
   if (useRerank) {
     perQueryRanked = await Promise.all(
       perQueryCandidates.map((cands, i) =>
-        rerankCandidates(queries[i], cands, Math.min(cap, perQueryTake), {
+        voyageRerank(queries[i], cands, Math.min(cap, perQueryTake), {
           timeoutMs: opts.timeoutMs ?? env.REQUEST_TIMEOUT_MS,
         }).catch((e) => {
-          logError(log, e, "rerankCandidates failed, fallback BM25", {
+          logError(log, e, "voyage rerank failed, fallback BM25", {
             query: queries[i],
           });
           return cands
@@ -92,6 +93,7 @@ export async function rankForQueries(
     queries: queries.length,
     candidates: perQueryCandidates.flat().length,
     final: final.length,
+    rerank: useRerank,
   });
   return final;
 }
@@ -149,34 +151,8 @@ export async function rerankCandidates(
   topK: number,
   opts?: { timeoutMs?: number }
 ): Promise<RankedChunk[]> {
-  const top = Math.min(topK, candidates.length);
-  if (top === 0) return [];
-
-  const res = await jinaRerank(
-    query,
-    candidates.map((c) => c.text),
-    top,
-    opts
-  );
-  const scored = new Map<number, number>();
-  for (const r of res) {
-    const idx = r.index ?? r.document_index ?? r.idx ?? r.docid ?? r.docIndex;
-    const rawScore = r.relevance_score ?? r.score ?? r.relevance ?? 0;
-    if (typeof idx === "number") scored.set(idx, clamp01(Number(rawScore)));
-  }
-
-  if (scored.size === 0) {
-    return candidates.slice(0, top).sort((a, b) => b.score - a.score);
-  }
-
-  const withScores = candidates
-    .slice(0, Math.max(top, candidates.length))
-    .map((c, i) => ({
-      ...c,
-      score: scored.get(i) ?? c.score,
-    }));
-
-  return withScores.sort((a, b) => b.score - a.score).slice(0, top);
+  // Back-compat wrapper: uses Voyage SDK under the hood
+  return voyageRerank(query, candidates, topK, opts);
 }
 
 function normalizeBm25Row(r: any): RankedChunk {
@@ -235,78 +211,101 @@ export function diversifyBySource(
   return out.slice(0, cap);
 }
 
-/* ------------------------------ Jina Reranker ------------------------------ */
+/* ------------------------------ Voyage SDK --------------------------------- */
 
-async function getFetch(): Promise<typeof fetch> {
-  if (typeof fetch !== "undefined") return fetch;
-
-  const mod = (await import("node-fetch")) as any;
-  return (mod.default ?? mod) as typeof fetch;
+let voyageClient: VoyageAIClient | null = null;
+function getVoyage(): VoyageAIClient | null {
+  if (voyageClient) return voyageClient;
+  const apiKey = process.env.VOYAGE_API_KEY;
+  if (!apiKey) return null;
+  voyageClient = new VoyageAIClient({ apiKey });
+  return voyageClient;
 }
 
-async function jinaRerank(
+async function voyageRerank(
   query: string,
-  documents: string[],
-  topN: number,
+  candidates: RankedChunk[],
+  topK: number,
   opts?: { timeoutMs?: number }
-): Promise<
-  Array<{
-    index?: number;
-    document_index?: number;
-    idx?: number;
-    docid?: number;
-    docIndex?: number;
-    relevance_score?: number;
-    score?: number;
-    relevance?: number;
-  }>
-> {
-  if (!env.JINA_API_KEY) return [];
-  const base = env.JINA_SEARCH_BASE || "https://api.jina.ai";
-  const url = `${base.replace(/\/+$/, "")}/v1/rerank`;
-  const { signal, cancel } = timeoutSignal(
-    opts?.timeoutMs ?? env.REQUEST_TIMEOUT_MS
-  );
-  const f = await getFetch();
+): Promise<RankedChunk[]> {
+  const client = getVoyage();
+  if (!client) {
+    // missing key → fallback to BM25
+    return candidates.slice(0, topK).sort((a, b) => b.score - a.score);
+  }
+
+  const top = Math.min(topK, candidates.length);
+  if (top === 0) return [];
+
+  const model = process.env.VOYAGE_RERANK_MODEL || "rerank-2.5-lite";
+  const docs = candidates.map((c) => c.text).slice(0, 1000); // Voyage limit
 
   try {
-    const res = await f(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.JINA_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "jina-reranker-v2-base-multilingual",
+    const resp = await client.rerank(
+      {
+        model,
         query,
-        top_n: Math.max(1, Math.min(topN, documents.length)),
-        documents,
-        return_documents: false, // per docs
-      }),
-      signal,
-    });
+        documents: docs,
+        top_k: Math.max(1, Math.min(top, docs.length)),
+        return_documents: false,
+        truncation: true, // per docs default
+      } as any,
+      {
+        timeoutInSeconds: Math.max(
+          1,
+          Math.floor((opts?.timeoutMs ?? env.REQUEST_TIMEOUT_MS) / 1000)
+        ),
+        // You can add abortSignal here if you thread it through opts
+      }
+    );
 
-    if (!res.ok) {
-      throw new Error(`Jina rerank HTTP ${res.status}`);
+    const results: Array<{ index: number; relevance_score: number }> =
+      Array.isArray((resp as any)?.data) ? (resp as any).data : [];
+
+    if (results.length === 0) {
+      return candidates.slice(0, top).sort((a, b) => b.score - a.score);
     }
 
-    const data = (await res.json()) as any;
-    return (data?.results ?? data?.data ?? data ?? []) as any[];
-  } finally {
-    cancel();
+    const scored = new Map<number, number>();
+    for (const r of results) {
+      if (typeof r.index === "number") {
+        scored.set(r.index, clamp01(Number(r.relevance_score ?? 0)));
+      }
+    }
+
+    const withScores = candidates.map((c, i) => ({
+      ...c,
+      score: scored.get(i) ?? c.score,
+    }));
+
+    return withScores.sort((a, b) => b.score - a.score).slice(0, top);
+  } catch (e) {
+    if (e instanceof VoyageAIError) {
+      // Log structured Voyage error details
+      logger.error(
+        {
+          mod: "rank",
+          err: { status: e.statusCode, message: e.message, body: e.body },
+        },
+        "Voyage rerank error"
+      );
+    } else {
+      logError(logger, e, "Voyage rerank error");
+    }
+    return candidates.slice(0, top).sort((a, b) => b.score - a.score);
   }
 }
 
 /* --------------------------------- Timing ---------------------------------- */
 
-function timeoutSignal(timeoutMs: number) {
-  const ac = new AbortController();
-  const t = setTimeout(
-    () => ac.abort(new DOMException("Timeout", "TimeoutError")),
-    timeoutMs
-  );
-  return { signal: ac.signal, cancel: () => clearTimeout(t) };
-}
+// function timeoutSignal(timeoutMs: number) {
+//   const ac = new AbortController();
+//   const t = setTimeout(
+//     () => ac.abort(new DOMException("Timeout", "TimeoutError")),
+//     timeoutMs
+//   );
+//   return { signal: ac.signal, cancel: () => clearTimeout(t) };
+// }
 
 function clamp01(x: number): number {
   if (!Number.isFinite(x)) return 0;

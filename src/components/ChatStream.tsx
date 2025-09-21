@@ -12,6 +12,16 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 
+import {
+  Loader2,
+  CheckCircle2,
+  AlertTriangle,
+  Copy as CopyIcon,
+  Download as DownloadIcon,
+  ChevronsDown,
+  ArrowDown,
+} from "lucide-react";
+
 /* -------------------------------- Helpers --------------------------------- */
 
 function stageBadgeVariant(
@@ -33,6 +43,24 @@ function stageBadgeVariant(
     default:
       return "secondary";
   }
+}
+
+const STAGE_LABEL: Record<string, string> = {
+  idle: "Idle",
+  plan: "Plan",
+  search: "Search",
+  read: "Read",
+  rank: "Rank",
+  answer: "Answer",
+  verify: "Verify",
+  done: "Done",
+  error: "Error",
+};
+
+function formatCompact(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 10000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+  return Math.round(n / 1000) + "k";
 }
 
 /**
@@ -109,13 +137,14 @@ function EmptyState({ stage }: { stage: string }) {
 export function ChatStream() {
   const stage = useResearchStage();
 
-  // FIX: Select each slice separately to avoid creating a new object each render
-  // (prevents "getServerSnapshot should be cached" in React 19/Next 15)
+  // Select slices individually to avoid recreating objects
   const sources = useResearchStore((s) => s.sources);
   const answerMarkdown = useResearchStore((s) => s.answerMarkdown);
   const tokensAppended = useResearchStore((s) => s.tokensAppended);
 
   const [autoScroll, setAutoScroll] = useState(true);
+  const [showJump, setShowJump] = useState(false);
+  const [copied, setCopied] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
   // Convert [n] to [n](#cite-n) for clickable citations
@@ -124,18 +153,56 @@ export function ChatStream() {
     [answerMarkdown]
   );
 
+  const prefersReducedMotion =
+    typeof window !== "undefined" &&
+    window.matchMedia &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // Auto-scroll when new content arrives
   useEffect(() => {
     if (!autoScroll) return;
     const el = containerRef.current;
     if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-  }, [tokensAppended, autoScroll]);
+    el.scrollTo({
+      top: el.scrollHeight,
+      behavior: prefersReducedMotion ? "auto" : "smooth",
+    });
+  }, [tokensAppended, autoScroll, prefersReducedMotion]);
+
+  // Detect if user scrolled up and show "Jump to latest"
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const atBottom =
+        el.scrollHeight - (el.scrollTop + el.clientHeight) < 16;
+      setShowJump(!atBottom);
+      if (autoScroll && !atBottom) {
+        setAutoScroll(false);
+      }
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [autoScroll]);
+
+  const jumpToLatest = () => {
+    const el = containerRef.current;
+    if (!el) return;
+    el.scrollTo({
+      top: el.scrollHeight,
+      behavior: prefersReducedMotion ? "auto" : "smooth",
+    });
+    setAutoScroll(true);
+  };
 
   const onCopy = async () => {
     try {
       await navigator.clipboard.writeText(answerMarkdown || "");
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
     } catch {
-      // ignore
+      /* ignore */
     }
   };
 
@@ -165,15 +232,37 @@ export function ChatStream() {
     }
   };
 
+  const isActive =
+    stage === "plan" ||
+    stage === "search" ||
+    stage === "read" ||
+    stage === "rank" ||
+    stage === "answer" ||
+    stage === "verify";
+
   return (
-    <section className="rounded-md border bg-background">
+    <section
+      className="relative rounded-md border bg-background"
+      aria-live="polite"
+      aria-busy={isActive}
+    >
       <div className="flex items-center gap-2 px-3 py-2">
-        <Badge variant={stageBadgeVariant(stage)} className="uppercase">
-          {stage}
+        <Badge variant={stageBadgeVariant(stage)} className="inline-flex items-center gap-1.5 uppercase">
+          {stage === "error" ? (
+            <AlertTriangle className="h-3.5 w-3.5" aria-hidden />
+          ) : stage === "done" ? (
+            <CheckCircle2 className="h-3.5 w-3.5" aria-hidden />
+          ) : (
+            <Loader2
+              className={`h-3.5 w-3.5 ${isActive ? "animate-spin" : ""}`}
+              aria-hidden
+            />
+          )}
+          {STAGE_LABEL[stage] ?? stage}
         </Badge>
         <span className="text-xs text-muted-foreground">
           {tokensAppended > 0
-            ? `${tokensAppended} chars streamed`
+            ? `${formatCompact(tokensAppended)} tokens streamed`
             : "Awaiting output"}
         </span>
         <div className="ml-auto flex items-center gap-2">
@@ -181,23 +270,29 @@ export function ChatStream() {
             variant="secondary"
             size="sm"
             onClick={() => setAutoScroll((s) => !s)}
+            title={autoScroll ? "Disable auto-scroll" : "Enable auto-scroll"}
           >
-            {autoScroll ? "Auto-scroll: On" : "Auto-scroll: Off"}
+            <ChevronsDown className="mr-2 h-4 w-4" />
+            {autoScroll ? "Auto-scroll On" : "Auto-scroll Off"}
           </Button>
           <Button
             variant="ghost"
             size="sm"
             onClick={onCopy}
             disabled={!answerMarkdown}
+            title="Copy answer to clipboard"
           >
-            Copy
+            <CopyIcon className="mr-2 h-4 w-4" />
+            {copied ? "Copied" : "Copy"}
           </Button>
           <Button
             variant="ghost"
             size="sm"
             onClick={onDownload}
             disabled={!answerMarkdown}
+            title="Download as Markdown"
           >
+            <DownloadIcon className="mr-2 h-4 w-4" />
             Download .md
           </Button>
         </div>
@@ -217,9 +312,16 @@ export function ChatStream() {
               a({ href, children, ...props }) {
                 const isCitation =
                   typeof href === "string" && href.startsWith("#cite-");
+                const isExternal =
+                  typeof href === "string" &&
+                  !href.startsWith("#") &&
+                  !href.startsWith("mailto:");
                 return (
                   <a
                     href={href}
+                    {...(isExternal
+                      ? { target: "_blank", rel: "noopener noreferrer" }
+                      : {})}
                     {...props}
                     onClick={(e) => handleCitationClick(e, href)}
                     className={
@@ -254,6 +356,21 @@ export function ChatStream() {
           <EmptyState stage={stage} />
         )}
       </div>
+
+      {/* Jump to latest (appears when user scrolls up) */}
+      {showJump && !autoScroll && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
+          <Button
+            type="button"
+            size="sm"
+            className="pointer-events-auto shadow-md"
+            onClick={jumpToLatest}
+          >
+            <ArrowDown className="mr-2 h-4 w-4" />
+            Jump to latest
+          </Button>
+        </div>
+      )}
     </section>
   );
 }

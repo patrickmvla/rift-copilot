@@ -31,6 +31,7 @@ import {
   VerifyClaimsResponseSchema,
 } from "../types";
 import { deepsearch } from "./deepsearch";
+import type { SearchResult } from "./deepsearch";
 import { readUrl } from "./reader";
 import {
   buildPlanPrompt,
@@ -38,6 +39,7 @@ import {
   buildVerifyClaimsPrompt,
 } from "../prompts";
 import { streamCompletion, generateCompletion } from "./groq";
+import { rankForQueries } from "./rank";
 
 export type DeepResearchEmitEvent =
   | {
@@ -52,7 +54,8 @@ export type DeepResearchEmitEvent =
   | { event: "sources"; data: SourceRef[] }
   | { event: "claims"; data: VerifyClaimsResponse }
   | { event: "error"; data: { message: string } }
-  | { event: "done"; data: { threadId: string } };
+  | { event: "done"; data: { threadId: string } }
+  | { event: "answer"; data: { text: string } };
 
 export type ProgressStage =
   | "plan"
@@ -129,23 +132,40 @@ export async function deepResearch(
     opts.perQueryResults ??
     (req.depth === "deep" ? 12 : req.depth === "quick" ? 4 : 8);
 
-  const searchResults = (
-    await mapLimit(plan.subqueries, 3, (q) =>
-      withRetry(
-        () =>
-          deepsearch(q, {
-            size: perQuery,
-            timeRange: req.timeRange,
-            allowedDomains: req.allowedDomains,
-            disallowedDomains: req.disallowedDomains,
-          }),
-        { retries: 2, baseDelay: 400, signal: abortSig }
-      )
+  // Fetch results per subquery (titles preserved)
+  const allResults: SearchResult[][] = await mapLimit(plan.subqueries, 3, (q) =>
+    withRetry(
+      () =>
+        deepsearch(q, {
+          size: perQuery,
+          timeRange: req.timeRange,
+          allowedDomains: req.allowedDomains,
+          disallowedDomains: req.disallowedDomains,
+          region: req.region,
+          abortSignal: abortSig,
+        }),
+      { retries: 2, baseDelay: 400, signal: abortSig }
     )
-  ).flat();
+  );
+
+  const searchResults = allResults.flat();
+
+  // Keep first-seen title per URL
+  const urlMeta = new Map<string, { title?: string | null }>();
+  for (const r of searchResults) {
+    if (!urlMeta.has(r.url)) urlMeta.set(r.url, { title: r.title ?? null });
+  }
 
   const deduped = dedupeUrls(searchResults.map((r) => r.url));
   searchSpan.end({ urls: deduped.length });
+  emit({
+    event: "progress",
+    data: {
+      stage: "search",
+      message: `Found ${deduped.length} unique URLs`,
+      meta: { unique: deduped.length },
+    },
+  });
 
   if (deduped.length === 0) {
     const assistantText =
@@ -192,13 +212,41 @@ export async function deepResearch(
   );
   const urlsInline = deduped.slice(0, inlineCap);
 
-  const ingested = await mapLimit(urlsInline, 4, (u) =>
-    withRetry(() => ingestUrl(u, { title: undefined }), {
-      retries: 1,
-      baseDelay: 500,
-      signal: abortSig,
-    })
+  // Read concurrency (tunable via READER_CONCURRENCY; default 2)
+  const readConc = Math.max(
+    1,
+    Math.min(4, Number(process.env.READER_CONCURRENCY ?? 2))
   );
+
+  // Ingest with small progress updates
+  let readDone = 0;
+  const ingested = await mapLimit(urlsInline, readConc, async (u) => {
+    const res = await withRetry(
+      () =>
+        ingestUrl(
+          u,
+          { title: urlMeta.get(u)?.title ?? undefined },
+          chooseReaderPrefer(u)
+        ),
+      {
+        retries: 1,
+        baseDelay: 500,
+        signal: abortSig,
+      }
+    );
+    readDone++;
+    if (readDone === urlsInline.length || readDone % 2 === 0) {
+      emit({
+        event: "progress",
+        data: {
+          stage: "read",
+          message: `Read ${readDone}/${urlsInline.length}`,
+          meta: { done: readDone, total: urlsInline.length },
+        },
+      });
+    }
+    return res;
+  });
 
   const okIngests = ingested.filter(
     (x): x is IngestResult & { ok: true } => x.ok
@@ -215,30 +263,90 @@ export async function deepResearch(
 
   emit({ event: "sources", data: sourceRefs });
 
+  /* ------------------------------ Rank ------------------------------------ */
+
   emit({
     event: "progress",
     data: { stage: "rank", message: "Ranking snippets" },
   });
   const rankSpan = startSpan(log, "rank");
 
+  // Ensure FTS exists and rebuild so existing chunks are indexed
   await ensureFts5();
 
   const rankLimit = opts.rankLimit ?? 24;
-  const hits = await rankChunks(
-    [req.question, ...plan.subqueries],
-    rankLimit * 3
-  );
+  const limitPerSource = Math.max(1, Math.min(opts.limitPerSource ?? 3, 8));
 
-  const selected: RankedHit[] = diversifyBySource(hits, rankLimit);
-  rankSpan.end({ selected: selected.length });
+  // Voyage rerank enabled via ENABLE_RERANK + VOYAGE_API_KEY in env
+  let ranked = await rankForQueries([req.question, ...plan.subqueries], {
+    cap: rankLimit,
+    perQueryTake: rankLimit * 3,
+    diversifyBySource: true,
+    perSourceLimit: limitPerSource,
+    enableRerank: true,
+    timeoutMs: env.REQUEST_TIMEOUT_MS,
+  });
+
+  // Fallbacks if FTS index was empty or rank failed to find anything
+  if (ranked.length === 0) {
+    // Try to force a backfill if the FTS index is empty
+    await backfillFtsFromChunks();
+    // Debug: Log FTS count post-backfill
+    const cntFtsPost = await client.execute({
+      sql: `SELECT COUNT(1) AS c FROM chunks_fts;`,
+      args: [],
+    });
+    const cFtsPost = Number((cntFtsPost.rows?.[0] as any)?.c ?? 0);
+    log.info({ ftsCountPostBackfill: cFtsPost, recentChunks: sourceRefs.length },
+      "Post-backfill FTS check");
+
+    ranked = await rankForQueries([req.question, ...plan.subqueries], {
+      cap: rankLimit,
+      perQueryTake: rankLimit * 3,
+      diversifyBySource: true,
+      perSourceLimit: limitPerSource,
+      enableRerank: true,
+      timeoutMs: env.REQUEST_TIMEOUT_MS,
+    });
+  }
+
+  // Last-resort fallback using LIKE over recently ingested sources
+  let hitsForContext: Array<{ id: string; sourceId: string; text: string }> =
+    ranked;
+
+  if (hitsForContext.length === 0) {
+    const likeHits = await likeFallbackRank(
+      [req.question, ...plan.subqueries],
+      sourceRefs.map((s) => s.id),
+      Math.min(rankLimit * 2, 48) // Cap fallback harder (48 max, not 72)
+    );
+    hitsForContext = likeHits;
+    emit({
+      event: "progress",
+      data: {
+        stage: "rank",
+        message: `Fallback ranking (LIKE) selected ${hitsForContext.length} snippets`,
+        meta: { selected: hitsForContext.length, fallback: "like" },
+      },
+    });
+  }
+
+  rankSpan.end({ selected: hitsForContext.length });
+  emit({
+    event: "progress",
+    data: {
+      stage: "rank",
+      message: `Selected ${hitsForContext.length} snippets`,
+      meta: { selected: hitsForContext.length },
+    },
+  });
 
   const selectedSourceIds: string[] = Array.from(
-    new Set(selected.map((h: RankedHit) => h.sourceId))
+    new Set(hitsForContext.map((h) => h.sourceId))
   );
 
-  const limitPerSource = Math.max(1, Math.min(opts.limitPerSource ?? 3, 8));
   const perSourceBags = new Map<string, ContextChunk[]>();
-  for (const h of selected) {
+  for (const h of hitsForContext) {
     const bag = perSourceBags.get(h.sourceId) ?? [];
     if (bag.length < limitPerSource) {
       bag.push({ sourceId: h.sourceId, chunkId: h.id, text: h.text });
@@ -248,13 +356,11 @@ export async function deepResearch(
 
   const usedSourceRefs: SourceRef[] = [];
   let n = 1;
-  const indexMap = new Map<string, number>();
   for (const sid of selectedSourceIds) {
     const found = sourceRefs.find((s) => s.id === sid);
     if (found) {
       usedSourceRefs.push({ ...found, index: n });
     } else {
-      // sid typed as string; eq expects string
       const srow = await db
         .select()
         .from(sourcesTable)
@@ -271,7 +377,6 @@ export async function deepResearch(
         });
       }
     }
-    indexMap.set(sid, n);
     n++;
   }
 
@@ -281,37 +386,125 @@ export async function deepResearch(
     for (const c of bag) contextChunks.push(c);
   }
 
+   /* ------------------------------ Answer ---------------------------------- */
+
   emit({
     event: "progress",
     data: { stage: "answer", message: "Drafting answer" },
   });
 
-  const { system: answerSystem, user: answerUser } = buildAnswerPrompt({
-    question: req.question,
-    sources: usedSourceRefs,
-    chunks: contextChunks,
-    style: req.depth === "quick" ? "concise" : "neutral",
-  });
+  // Limit the input to avoid Groq on_demand 6k TPM spikes.
+  // You can tune these via env if needed.
+  const INPUT_BUDGET_TOKENS = Math.max(
+    1200,
+    Number(process.env.ANSWER_INPUT_BUDGET_TOKENS ?? 3200) // tighter default
+  );
+  const PROMPT_OVERHEAD_TOKENS = Math.max(
+    400,
+    Number(process.env.ANSWER_PROMPT_OVERHEAD_TOKENS ?? 800)
+  );
+  const MAX_CHARS_PER_CHUNK = Math.max(
+    400,
+    Number(process.env.ANSWER_MAX_CHARS_PER_CHUNK ?? 900)
+  );
 
-  const answerSpan = startSpan(log, "answer");
+  // Only include sources actually referenced by the selected chunks
+  const ctxSourceIds = new Set(contextChunks.map((c) => c.sourceId));
+  const minimalSourceRefs = usedSourceRefs.filter((s) =>
+    ctxSourceIds.has(s.id)
+  );
 
-  const answerResult = await streamCompletion({
-    model: "answer",
-    system: answerSystem,
-    prompt: answerUser,
-    temperature: 0.2,
-    maxOutputTokens: 1200,
-    abortSignal: abortSig,
-  });
+  // Shrink chunks (truncate long ones) and trim to the token budget
+  const shrunkChunks: ContextChunk[] = contextChunks.map((c) => ({
+    ...c,
+    text: shrinkChunkText(c.text, MAX_CHARS_PER_CHUNK),
+  }));
+  const budgetedChunks = trimChunksToBudget(
+    shrunkChunks,
+    INPUT_BUDGET_TOKENS,
+    PROMPT_OVERHEAD_TOKENS
+  );
 
-  let answerBuffer = "";
-  for await (const delta of answerResult.textStream) {
-    answerBuffer += delta;
-    emit({ event: "token", data: delta });
+  const buildAndStream = async (chunksForPrompt: ContextChunk[]) => {
+    const { system: answerSystem, user: answerUser } = buildAnswerPrompt({
+      question: req.question,
+      sources: minimalSourceRefs, // use minimal refs to save tokens
+      chunks: chunksForPrompt,
+      style: req.depth === "quick" ? "concise" : "neutral",
+    });
+
+    const answerSpan = startSpan(log, "answer");
+    const answerResult = await streamCompletion({
+      model: "answer",
+      system: answerSystem,
+      prompt: answerUser,
+      temperature: 0.2,
+      maxOutputTokens: 900, // keep completion capped too
+      abortSignal: abortSig,
+    });
+
+    let answerBuffer = "";
+    let streamedChunks = 0;
+
+    for await (const delta of answerResult.textStream) {
+      if (delta && delta.length) {
+        streamedChunks++;
+        answerBuffer += delta;
+        emit({ event: "token", data: delta });
+      }
+    }
+
+    const full = answerBuffer.trim();
+
+    // Safety: if client ignored stream tokens, still deliver full answer once
+    if (streamedChunks === 0 && full.length > 0) {
+      emit({ event: "token", data: full });
+    }
+
+    // Also emit a non-streaming "answer" event for consumers that prefer it
+    emit({ event: "answer", data: { text: full } });
+
+    answerSpan.end({ tokens: estimateTokens(full) });
+    return full;
+  };
+
+  let answerMarkdown = "";
+  let skipVerifyForBudget = false;
+
+  try {
+    // First attempt with budgeted chunks
+    answerMarkdown = await buildAndStream(budgetedChunks);
+  } catch (e: any) {
+    const msg = String(e?.message || "").toLowerCase();
+    const isTPM =
+      msg.includes("tokens per minute") ||
+      msg.includes("tpm") ||
+      msg.includes("request too large");
+
+    if (isTPM) {
+      // Retry once with half the budget (smaller context)
+      const smallerBudget = Math.max(1000, Math.floor(INPUT_BUDGET_TOKENS / 2));
+      const smaller = trimChunksToBudget(
+        shrunkChunks,
+        smallerBudget,
+        PROMPT_OVERHEAD_TOKENS
+      );
+      emit({
+        event: "progress",
+        data: {
+          stage: "answer",
+          message: "Context too large; retrying with smaller context",
+          meta: { budgetTokens: smallerBudget },
+        },
+      });
+      answerMarkdown = await buildAndStream(smaller);
+      skipVerifyForBudget = String(process.env.SKIP_VERIFY_ON_TPM ?? "1") !== "0";
+    } else {
+      throw e;
+    }
   }
-  const answerMarkdown = answerBuffer.trim();
-  answerSpan.end({ tokens: estimateTokens(answerMarkdown) });
 
+  // Persist conversation
   const userMsgId = newId();
   const assistantMsgId = newId();
   await db
@@ -326,6 +519,7 @@ export async function deepResearch(
       },
     ])
     .run();
+  /* ------------------------------ Verify ---------------------------------- */
 
   emit({
     event: "progress",
@@ -333,36 +527,108 @@ export async function deepResearch(
   });
   const verifySpan = startSpan(log, "verify");
 
-  const verifyPrompt = buildVerifyClaimsPrompt({
-    answerMarkdown,
-    snippets: contextChunks.map((c) => ({
-      sourceId: c.sourceId,
-      chunkId: c.chunkId,
-      text: c.text,
-    })),
-    maxClaims: req.depth === "quick" ? 6 : req.depth === "deep" ? 18 : 12,
-  });
+  // Reuse answer's budget logic for verify (tighter, since non-streaming)
+  const VERIFY_INPUT_BUDGET_TOKENS = Math.max(
+    800,
+    Number(process.env.VERIFY_INPUT_BUDGET_TOKENS ?? 1500) // Even tighter
+  );
+  const VERIFY_OVERHEAD_TOKENS = Math.max(
+    300,
+    Number(process.env.VERIFY_PROMPT_OVERHEAD_TOKENS ?? 500)
+  );
 
-  const verifyRes = await generateCompletion({
-    model: "verify",
-    system: verifyPrompt.system,
-    prompt: verifyPrompt.user,
-    temperature: 0,
-    maxOutputTokens: 1200,
-    abortSignal: abortSig,
-  });
+  // For verify, shrink and trim snippets directly (reuse answer logic)
+  const verifyShrunkSnippets: { sourceId: string; chunkId?: string; text: string }[] = shrunkChunks.map((c) => ({
+    sourceId: c.sourceId,
+    chunkId: c.chunkId,
+    text: shrinkChunkText(c.text, 400), // Tighter for verify
+  }));
 
-  const verifiedJson = safeJson(verifyRes.text);
-  const verifiedParse = VerifyClaimsResponseSchema.safeParse(verifiedJson);
-  const verified: VerifyClaimsResponse = verifiedParse.success
-    ? verifiedParse.data
-    : { claims: [] };
+  // Trim to budget (treat as ContextChunk for reuse)
+  const verifySnippetsBudgeted = trimChunksToBudget(
+    verifyShrunkSnippets.map(s => ({ sourceId: s.sourceId, chunkId: s.chunkId, text: s.text } as ContextChunk)),
+    VERIFY_INPUT_BUDGET_TOKENS,
+    VERIFY_OVERHEAD_TOKENS
+  ).map(c => ({
+    sourceId: c.sourceId,
+    chunkId: c.chunkId,
+    text: c.text
+  } as { sourceId: string; chunkId?: string; text: string }));
 
-  await bindOffsetsForEvidence(verified);
-  await persistClaims(threadId, assistantMsgId, verified);
+  // If no ranked context, skip verification entirely
+  let verified: VerifyClaimsResponse = { claims: [] };
+  let skipVerify = contextChunks.length === 0 || usedSourceRefs.length === 0 || skipVerifyForBudget;
+
+  if (!skipVerify) {
+    // Budget check: Est. tokens for verify prompt
+    const snippetsEst = verifySnippetsBudgeted.reduce((sum, s) => sum + estimateTokens(s.text), 0);
+    const estVerifyTokens = estimateTokens(answerMarkdown) + snippetsEst + VERIFY_OVERHEAD_TOKENS;
+
+    if (estVerifyTokens > 5000) { // Hard cap before Groq call
+      log.warn({ estTokens: estVerifyTokens, snippets: verifySnippetsBudgeted.length },
+        "Verify prompt too large; skipping");
+      skipVerify = true;
+      verified = { claims: [] };
+    } else {
+      const verifyPrompt = buildVerifyClaimsPrompt({
+        answerMarkdown,
+        snippets: verifySnippetsBudgeted,
+        maxClaims: req.depth === "quick" ? 6 : req.depth === "deep" ? 18 : 12,
+      });
+
+      const verifyRes = await generateCompletion({
+        model: "verify",
+        system: verifyPrompt.system,
+        prompt: verifyPrompt.user,
+        temperature: 0,
+        maxOutputTokens: 1200,
+        abortSignal: abortSig,
+      }).catch((e: any) => {
+        const msg = String(e?.message || "").toLowerCase();
+        const isTPM = msg.includes("tokens per minute") || msg.includes("tpm") || msg.includes("request too large");
+        if (isTPM) {
+          log.warn({ error: e }, "Verify TPM error; skipping");
+          skipVerify = true;
+          return { text: '{}' }; // Mock empty JSON
+        }
+        throw e;
+      });
+
+      const verifiedJson = safeJson(verifyRes?.text ?? '{}');
+      const verifiedParse = VerifyClaimsResponseSchema.safeParse(verifiedJson);
+      const rawVerified: VerifyClaimsResponse = verifiedParse.success
+        ? verifiedParse.data
+        : { claims: [] };
+
+      // Keep only evidence that references our ranked chunks and known sources
+      const allowedSourceIds = new Set<string>(
+        usedSourceRefs.map((s) => s.id).filter(isNonEmptyString)
+      );
+      const allowedChunkIds = new Set<string>(
+        verifySnippetsBudgeted.map((s) => s.chunkId).filter(isNonEmptyString)
+      );
+
+      verified = normalizeVerifiedClaims(
+        rawVerified,
+        allowedSourceIds,
+        allowedChunkIds
+      );
+      // Bind offsets only for valid chunk-backed evidence
+      await bindOffsetsForEvidence(verified);
+    }
+  }
+
+  // Persist (no-op if there are no claims or no valid evidence)
+  if (!skipVerify) {
+    await persistClaims(threadId, assistantMsgId, verified);
+  }
 
   emit({ event: "claims", data: verified });
-  verifySpan.end({ claimCount: verified.claims.length });
+  verifySpan.end({ 
+    claimCount: verified.claims.length,
+    estInputTokens: estVerifyTokens ?? 0, // Add for monitoring
+    snippetCount: verifySnippetsBudgeted.length 
+  });
 
   emit({ event: "done", data: { threadId } });
 
@@ -397,10 +663,40 @@ async function planSubqueries(req: ResearchRequest) {
     maxOutputTokens: 600,
   });
 
-  const json = safeJson(res.text);
-  const out = PlanResponseSchema.safeParse(json);
-  if (!out.success)
-    throw new Error("Failed to parse plan JSON: " + out.error.message);
+  const raw = safeJson(res.text);
+
+  // Normalize subqueries to string[]
+  if (Array.isArray(raw?.subqueries)) {
+    raw.subqueries = raw.subqueries
+      .map((x: any) =>
+        typeof x === "string"
+          ? x
+          : typeof x?.query === "string"
+          ? x.query
+          : typeof x?.text === "string"
+          ? x.text
+          : typeof x?.q === "string"
+          ? x.q
+          : null
+      )
+      .filter((s: any) => typeof s === "string" && s.trim().length > 0);
+  }
+
+  const out = PlanResponseSchema.safeParse(raw);
+  if (!out.success) {
+    // Fallback to naive plan
+    return {
+      intent: req.question,
+      subqueries: [req.question],
+      focus: [],
+      constraints: {
+        timeRange: req.timeRange ?? null,
+        region: req.region ?? null,
+        allowedDomains: req.allowedDomains ?? null,
+        disallowedDomains: req.disallowedDomains ?? null,
+      },
+    };
+  }
   if (!out.data.subqueries?.length) out.data.subqueries = [req.question];
   return out.data;
 }
@@ -419,7 +715,8 @@ type IngestResult =
 
 async function ingestUrl(
   url: string,
-  meta?: { title?: string }
+  meta?: { title?: string },
+  prefer?: "jina" | "raw"
 ): Promise<IngestResult> {
   try {
     const existing = await db
@@ -434,7 +731,9 @@ async function ingestUrl(
     if (existing.length > 0) {
       sourceId = existing[0].id!;
     } else {
-      const content = await readUrl(url);
+      const content = await readUrl(url, {
+        prefer: prefer ?? chooseReaderPrefer(url),
+      });
       const text = sanitizeText(content.text, {
         normalize: "NFKC",
         removeControl: true,
@@ -512,115 +811,8 @@ async function ingestUrl(
 
 /* --------------------------------- Ranking --------------------------------- */
 
-type RankedHit = { id: string; sourceId: string; text: string; score: number };
-
-async function rankChunks(
-  queries: string[],
-  cap: number
-): Promise<RankedHit[]> {
-  const perQ = Math.max(4, Math.ceil(cap / Math.max(1, queries.length)) * 2);
-  const results: RankedHit[] = [];
-
-  for (const qRaw of queries) {
-    const q = toFtsMatchQuery(qRaw);
-
-    try {
-      const res = await client.execute({
-        sql: `
-          SELECT c.id AS id,
-                 c.source_id AS sourceId,
-                 c.text AS text,
-                 bm25(chunks_fts) AS bm25
-          FROM chunks_fts
-          JOIN chunks c ON c.rowid = chunks_fts.rowid
-          WHERE chunks_fts MATCH ?
-          LIMIT ?;
-        `,
-        args: [q, perQ],
-      });
-
-      const rows = Array.isArray(res.rows) ? (res.rows as any[]) : [];
-      for (const r of rows) {
-        const bm = typeof r.bm25 === "number" ? r.bm25 : Number(r.bm25 ?? 0);
-        const score = bm > 0 ? 1 / (1 + bm) : 0.5;
-        results.push({
-          id: String(r.id),
-          sourceId: String(r.sourceId),
-          text: String(r.text ?? ""),
-          score,
-        });
-      }
-    } catch (e: any) {
-      if (String(e?.message || "").includes("no such table: chunks_fts")) {
-        await ensureFts5();
-        const res2 = await client.execute({
-          sql: `
-            SELECT c.id AS id,
-                   c.source_id AS sourceId,
-                   c.text AS text,
-                   bm25(chunks_fts) AS bm25
-            FROM chunks_fts
-            JOIN chunks c ON c.rowid = chunks_fts.rowid
-            WHERE chunks_fts MATCH ?
-            LIMIT ?;
-          `,
-          args: [q, perQ],
-        });
-        const rows2 = Array.isArray(res2.rows) ? (res2.rows as any[]) : [];
-        for (const r of rows2) {
-          const bm = typeof r.bm25 === "number" ? r.bm25 : Number(r.bm25 ?? 0);
-          const score = bm > 0 ? 1 / (1 + bm) : 0.5;
-          results.push({
-            id: String(r.id),
-            sourceId: String(r.sourceId),
-            text: String(r.text ?? ""),
-            score,
-          });
-        }
-      } else {
-        throw e;
-      }
-    }
-  }
-
-  const best = new Map<string, RankedHit>();
-  for (const h of results) {
-    const prev = best.get(h.id);
-    if (!prev || h.score > prev.score) best.set(h.id, h);
-  }
-
-  const sorted = Array.from(best.values()).sort((a, b) => b.score - a.score);
-  return sorted.slice(0, cap);
-}
-
-function diversifyBySource(hits: RankedHit[], cap: number): RankedHit[] {
-  const buckets = new Map<string, RankedHit[]>();
-  for (const h of hits) {
-    const list = buckets.get(h.sourceId) ?? [];
-    list.push(h);
-    buckets.set(h.sourceId, list);
-  }
-  for (const [, list] of buckets) list.sort((a, b) => b.score - a.score);
-
-  const order = Array.from(buckets.keys());
-  const out: RankedHit[] = [];
-  let idx = 0;
-
-  while (out.length < cap && buckets.size > 0) {
-    const key = order[idx % order.length];
-    const arr = buckets.get(key);
-    if (arr && arr.length > 0) {
-      out.push(arr.shift()!);
-      if (arr.length === 0) buckets.delete(key);
-    }
-    idx++;
-    if (idx > cap * 10) break;
-  }
-
-  return out;
-}
-
 async function ensureFts5(): Promise<void> {
+  // Create FTS table and triggers (external content)
   await client.execute({
     sql: `
       CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
@@ -656,26 +848,141 @@ async function ensureFts5(): Promise<void> {
     `,
     args: [],
   });
-}
 
-function toFtsMatchQuery(input: string): string {
-  const tokens = (input || "")
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 12);
-
-  if (tokens.length === 0) {
-    const safe = (input || "").replace(/["']/g, " ");
-    return `"${safe.trim()}"`;
+  // Try rebuild; if still empty, backfill manually
+  try {
+    await client.execute({
+      sql: `INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');`,
+      args: [],
+    });
+  } catch {
+    // ignore
   }
-
-  return tokens.map((t) => `"${t.replace(/"/g, " ")}"`).join(" AND ");
 }
+
+async function backfillFtsFromChunks() {
+  try {
+    const cntFts = await client.execute({
+      sql: `SELECT COUNT(1) AS c FROM chunks_fts;`,
+      args: [],
+    });
+    const cFts = Number((cntFts.rows?.[0] as any)?.c ?? 0);
+
+    if (cFts === 0) {
+      await client.execute({
+        sql: `INSERT INTO chunks_fts(rowid, text) SELECT rowid, text FROM chunks;`,
+        args: [],
+      });
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function likeFallbackRank(
+  queries: string[],
+  sourceIds: string[],
+  cap: number
+): Promise<Array<{ id: string; sourceId: string; text: string }>> {
+  if (sourceIds.length === 0) return [];
+  const tokens = extractQueryTerms(queries.join(" "));
+  if (tokens.length === 0) return [];
+
+  const placeholders = sourceIds.map(() => "?").join(",");
+  const likeClauses = tokens.map(() => "text LIKE ?").join(" OR ");
+  const args = [...sourceIds, ...tokens.map((t) => `%${t}%`), cap];
+
+  try {
+    const res = await client.execute({
+      sql: `
+        SELECT id, source_id AS sourceId, text, tokens
+        FROM chunks
+        WHERE source_id IN (${placeholders})
+          AND (${likeClauses})
+        ORDER BY tokens DESC
+        LIMIT ?;
+      `,
+      args,
+    });
+    const rows = Array.isArray(res.rows) ? (res.rows as any[]) : [];
+    return rows.map((r) => ({
+      id: String(r.id),
+      sourceId: String(r.sourceId),
+      text: String(r.text ?? ""),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function extractQueryTerms(q: string): string[] {
+  return (q || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .split(/\s+/)
+    .filter((t) => t.length >= 3 && !STOPWORDS.has(t))
+    .slice(0, 8);
+}
+
+const STOPWORDS = new Set<string>([
+  "the",
+  "and",
+  "for",
+  "with",
+  "that",
+  "are",
+  "was",
+  "were",
+  "this",
+  "from",
+  "have",
+  "has",
+  "had",
+  "but",
+  "not",
+  "you",
+  "your",
+  "into",
+  "about",
+  "over",
+  "under",
+  "what",
+  "which",
+  "when",
+  "where",
+  "why",
+  "how",
+  "who",
+  "whom",
+  "can",
+  "could",
+  "would",
+  "should",
+]);
 
 /* --------------------------------- Verify ---------------------------------- */
+
+function normalizeVerifiedClaims(
+  input: VerifyClaimsResponse,
+  allowedSourceIds: Set<string>,
+  allowedChunkIds: Set<string>
+): VerifyClaimsResponse {
+  // Drop evidence that doesn’t point to a known source/chunk
+  const claims = (input.claims ?? []).map((c) => {
+    const ev = (c.evidence ?? []).filter(
+      (e) =>
+        typeof e?.quote === "string" &&
+        e.quote.trim().length > 0 &&
+        typeof e?.sourceId === "string" &&
+        allowedSourceIds.has(e.sourceId) &&
+        typeof e?.chunkId === "string" &&
+        allowedChunkIds.has(e.chunkId)
+    );
+    return { ...c, evidence: ev };
+  });
+
+  return { claims };
+}
 
 async function bindOffsetsForEvidence(verified: VerifyClaimsResponse) {
   const chunkIds = Array.from(
@@ -756,6 +1063,62 @@ async function persistClaims(
 
 /* --------------------------------- Utils ---------------------------------- */
 
+// Trim chunks to fit a rough input-token budget.
+// We use estimateTokens (chars/4) for a conservative approximation and reserve ~600 tokens for prompt overhead.
+function trimChunksToBudget(
+  chunks: ContextChunk[],
+  budget: number,
+  reserve = 600
+): ContextChunk[] {
+  const max = Math.max(300, budget - reserve);
+  const out: ContextChunk[] = [];
+  let used = 0;
+
+  for (const c of chunks) {
+    const t = estimateTokens(c.text);
+    if (used + t > max) break;
+    out.push(c);
+    used += t;
+  }
+
+  // If everything exceeded budget (rare), keep the first chunk only
+  if (out.length === 0 && chunks.length > 0) {
+    out.push(chunks[0]);
+  }
+  return out;
+}
+
+// Shrink long chunks to reduce prompt token cost.
+// This is a simple hard cap; consider smarter clipping at sentence boundaries if needed.
+function shrinkChunkText(text: string, maxChars: number): string {
+  if (!text || text.length <= maxChars) return text;
+  // Keep start and end to retain some context around citations
+  const head = Math.floor(maxChars * 0.7);
+  const tail = maxChars - head;
+  return `${text.slice(0, head)}\n…\n${text.slice(-tail)}`;
+}
+
+// Trim a list of chunks to fit a rough input token budget.
+// 'reserve' accounts for system/user prompt overhead and citations format.
+// function trimChunksToBudget(
+//   chunks: ContextChunk[],
+//   budgetTokens: number,
+//   reserveTokens = 800
+// ): ContextChunk[] {
+//   const max = Math.max(300, budgetTokens - reserveTokens);
+//   const out: ContextChunk[] = [];
+//   let used = 0;
+
+//   for (const c of chunks) {
+//     const t = estimateTokens(c.text);
+//     if (used + t > max) break;
+//     out.push(c);
+//     used += t;
+//   }
+//   if (out.length === 0 && chunks.length > 0) out.push(chunks[0]); // never empty
+//   return out;
+// }
+
 function tryDomain(u: string): string {
   try {
     return new URL(u).hostname;
@@ -775,6 +1138,10 @@ function dedupeUrls(urls: string[]): string[] {
     }
   }
   return out;
+}
+
+function isNonEmptyString(x: unknown): x is string {
+  return typeof x === "string" && x.length > 0;
 }
 
 function safeJson(s: string): any {
@@ -853,3 +1220,40 @@ async function mapLimit<T, R>(
     next();
   });
 }
+
+// Decide whether to prefer Firecrawl ('jina') or raw for a given URL.
+// Tunable via:
+//  - READER_PREFER: "firecrawl" (default) or "raw"
+//  - READER_RAW_DOMAINS: CSV of hosts (or parent domains) to force raw on
+function chooseReaderPrefer(u: string): "jina" | "raw" {
+  const pref = (process.env.READER_PREFER ?? "firecrawl").toLowerCase();
+  const defaultPrefer: "jina" | "raw" = pref === "raw" ? "raw" : "jina";
+  let host = "";
+  try {
+    host = new URL(u).hostname.toLowerCase();
+  } catch {
+    // ignore
+  }
+  const rawCsv = process.env.READER_RAW_DOMAINS ?? "";
+  const userHosts = rawCsv
+    .split(",")
+    .map((x) => x.trim().toLowerCase())
+    .filter(Boolean);
+
+  const shouldRaw = (h: string) =>
+    userHosts.some((d) => h === d || h.endsWith("." + d)) ||
+    BUILTIN_RAW_DOMAINS.some((d) => h === d || h.endsWith("." + d));
+
+  if (host && shouldRaw(host)) return "raw";
+  return defaultPrefer;
+}
+
+// Some static/clean sites that work well with raw fetch
+const BUILTIN_RAW_DOMAINS = [
+  "wikipedia.org",
+  "pmc.ncbi.nlm.nih.gov",
+  "nih.gov",
+  "who.int",
+  "europa.eu",
+  "reddit.com", // Handles Firecrawl blocks
+];

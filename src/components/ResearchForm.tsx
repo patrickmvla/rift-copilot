@@ -42,6 +42,16 @@ import {
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 
+// icons
+import {
+  Loader2,
+  Play,
+  Square,
+  RotateCcw,
+  SlidersHorizontal,
+  Sparkles,
+} from "lucide-react";
+
 // Extend the request schema with form-only fields
 const FormSchema = ResearchRequestSchema.extend({
   allowedDomainsCsv: z.string().optional(),
@@ -53,11 +63,18 @@ const FormSchema = ResearchRequestSchema.extend({
 // IMPORTANT: use z.input so the form type matches Zod input (depth can be undefined due to default)
 type FormValues = z.input<typeof FormSchema>;
 
+const EXAMPLES = [
+  'What are the latest FDA updates on GLP-1 safety (2023–2025)?',
+  "Summarize credible evidence on PFAS exposure health risks since 2020",
+  "Compare RAG reranking methods and cite the best open-source evals",
+];
+
 export function ResearchForm() {
   const stage = useResearchStage();
   const store = useResearchStore();
   const [showAdvanced, setShowAdvanced] = useState(false);
   const handleRef = useRef<StreamHandle | null>(null);
+  const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const form = useForm<FormValues>({
     resolver: zodResolver(FormSchema),
@@ -92,6 +109,13 @@ export function ResearchForm() {
       }
     };
   }, []);
+
+  // Submit helper so we can trigger from Enter
+  const trySubmit = () => {
+    if (!canStop && questionVal && questionVal.trim().length >= 8) {
+      form.handleSubmit(onSubmit)();
+    }
+  };
 
   const onSubmit = async (values: FormValues) => {
     const allowedDomains = splitCsv(values.allowedDomainsCsv);
@@ -135,6 +159,12 @@ export function ResearchForm() {
     }
     store.reset();
     form.reset();
+    textAreaRef.current?.focus();
+  };
+
+  const applyExample = (q: string) => {
+    form.setValue("question", q, { shouldDirty: true, shouldTouch: true });
+    textAreaRef.current?.focus();
   };
 
   return (
@@ -149,21 +179,60 @@ export function ResearchForm() {
             <FormField
               control={form.control}
               name="question"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Research question</FormLabel>
-                  <FormControl>
-                    <Textarea
-                      placeholder='e.g., "What are the latest FDA updates on GLP-1 safety (2023–2025)?"'
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormDescription>
-                    Be specific to get better, more grounded results.
-                  </FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
+              render={({ field }) => {
+                // Avoid duplicate `ref`: extract and merge
+                const { ref: fieldRef, ...rest } = field;
+                return (
+                  <FormItem>
+                    <div className="flex items-center justify-between">
+                      <FormLabel>Research question</FormLabel>
+                      <p className="text-xs text-muted-foreground">
+                        Press Enter to run • Shift+Enter for a new line
+                      </p>
+                    </div>
+                    <FormControl>
+                      <Textarea
+                        {...rest}
+                        ref={(el) => {
+                          fieldRef(el);
+                          textAreaRef.current = el;
+                        }}
+                        placeholder='e.g., "What are the latest FDA updates on GLP-1 safety (2023–2025)?"'
+                        className="min-h-[110px] resize-y"
+                        onKeyDown={(e) => {
+                          const isComposing = (e.nativeEvent as any)?.isComposing;
+                          if (e.key === "Enter" && !e.shiftKey && !isComposing) {
+                            e.preventDefault();
+                            trySubmit();
+                          }
+                        }}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      Be specific to get better, more grounded results.
+                    </FormDescription>
+
+                    {/* Quick examples */}
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {EXAMPLES.map((ex) => (
+                        <Button
+                          key={ex}
+                          type="button"
+                          variant="secondary"
+                          size="sm"
+                          className="h-6 rounded-full px-2 text-[11px]"
+                          onClick={() => applyExample(ex)}
+                        >
+                          <Sparkles className="mr-1 h-3 w-3" />
+                          {ex}
+                        </Button>
+                      ))}
+                    </div>
+
+                    <FormMessage />
+                  </FormItem>
+                );
+              }}
             />
           </div>
 
@@ -192,7 +261,7 @@ export function ResearchForm() {
                     </SelectContent>
                   </Select>
                   <FormDescription>
-                    Quick for speed, Deep to explore more sources.
+                    Quick for speed; Deep to explore more sources.
                   </FormDescription>
                   <FormMessage />
                 </FormItem>
@@ -211,9 +280,7 @@ export function ResearchForm() {
                   <FormControl>
                     <Input placeholder="e.g., US, EU" {...field} />
                   </FormControl>
-                  <FormDescription>
-                    Use if the topic is region-sensitive.
-                  </FormDescription>
+                  <FormDescription>Use if the topic is region-sensitive.</FormDescription>
                   <FormMessage />
                 </FormItem>
               )}
@@ -224,10 +291,12 @@ export function ResearchForm() {
           <div className="col-span-12">
             <Button
               type="button"
-              variant="link"
-              className="px-0"
+              variant="ghost"
+              size="sm"
+              className="px-2"
               onClick={() => setShowAdvanced((s) => !s)}
             >
+              <SlidersHorizontal className="mr-2 h-4 w-4" />
               {showAdvanced ? "Hide advanced options" : "Show advanced options"}
             </Button>
           </div>
@@ -293,9 +362,7 @@ export function ResearchForm() {
                       <FormControl>
                         <Input type="date" {...field} />
                       </FormControl>
-                      <FormDescription>
-                        ISO date lower bound (optional).
-                      </FormDescription>
+                      <FormDescription>ISO date lower bound (optional).</FormDescription>
                       <FormMessage />
                     </FormItem>
                   )}
@@ -312,9 +379,7 @@ export function ResearchForm() {
                       <FormControl>
                         <Input type="date" {...field} />
                       </FormControl>
-                      <FormDescription>
-                        ISO date upper bound (optional).
-                      </FormDescription>
+                      <FormDescription>ISO date upper bound (optional).</FormDescription>
                       <FormMessage />
                     </FormItem>
                   )}
@@ -331,11 +396,19 @@ export function ResearchForm() {
           <div className="col-span-12 flex items-center gap-2 pt-1">
             <Button
               type="submit"
-              disabled={
-                !questionVal || questionVal.trim().length < 8 || canStop
-              }
+              disabled={!questionVal || questionVal.trim().length < 8 || canStop}
             >
-              {canStop ? "Running…" : "Start research"}
+              {canStop ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Running…
+                </>
+              ) : (
+                <>
+                  <Play className="mr-2 h-4 w-4" />
+                  Start research
+                </>
+              )}
             </Button>
 
             <Button
@@ -345,6 +418,7 @@ export function ResearchForm() {
               disabled={!canStop}
               title={canStop ? "Stop current run" : "Nothing to stop"}
             >
+              <Square className="mr-2 h-4 w-4" />
               Stop
             </Button>
 
@@ -354,6 +428,7 @@ export function ResearchForm() {
               onClick={hardReset}
               title="Clear current answer and state"
             >
+              <RotateCcw className="mr-2 h-4 w-4" />
               Reset
             </Button>
 

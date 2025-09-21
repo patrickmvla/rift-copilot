@@ -30,7 +30,36 @@ const ServerEnvSchema = z
 
     // Required service credentials
     GROQ_API_KEY: z.string().min(1, "GROQ_API_KEY is required"),
-    JINA_API_KEY: z.string().min(1, "JINA_API_KEY is required"),
+
+    // Optional provider credentials (Jina now optional)
+    JINA_API_KEY: z.string().optional(),
+
+    // Tavily (search)
+    TAVILY_API_KEY: z.string().optional(),
+    TAVILY_SEARCH_DEPTH: z.enum(["basic", "advanced"]).default("advanced"),
+    TAVILY_TOPIC: z.enum(["general", "news", "finance"]).default("general"),
+    TAVILY_COUNTRY: z.string().optional(), // exact country string per Tavily docs
+
+    // Firecrawl (reader)
+    FIRECRAWL_API_KEY: z.string().optional(),
+    FIRECRAWL_MAX_AGE_MS: z
+      .preprocess(parseNumber, z.number().int().positive().optional())
+      .optional(),
+    FIRECRAWL_COUNTRY: z.string().optional(), // e.g., 'US'
+    FIRECRAWL_LANGS: z.string().optional(), // CSV, e.g., 'en,de'
+
+    // Voyage (rerank)
+    VOYAGE_API_KEY: z.string().optional(),
+    VOYAGE_RERANK_MODEL: z
+      .enum([
+        "rerank-2.5",
+        "rerank-2.5-lite",
+        "rerank-2",
+        "rerank-2-lite",
+        "rerank-1",
+        "rerank-lite-1",
+      ])
+      .default("rerank-2.5-lite"),
 
     // Turso / libSQL
     TURSO_DATABASE_URL: z
@@ -42,7 +71,7 @@ const ServerEnvSchema = z
       ),
     TURSO_AUTH_TOKEN: z.string().optional(), // conditionally required (remote)
 
-    // Services config
+    // Legacy Jina base (safe to keep; ignored if not used)
     JINA_SEARCH_BASE: z.string().url().default("https://api.jina.ai"),
 
     // App flags and limits
@@ -56,6 +85,17 @@ const ServerEnvSchema = z
     MAX_SOURCES_INLINE: z
       .preprocess(parseNumber, z.number().int().min(1).max(24).default(12))
       .default(12),
+
+    // DB health/retry knobs
+    DB_HEALTHCHECK_TIMEOUT_MS: z
+      .preprocess(parseNumber, z.number().int().positive().default(3000))
+      .default(3000),
+    DB_MAX_RETRIES: z
+      .preprocess(parseNumber, z.number().int().min(0).default(1))
+      .default(1),
+    DB_RETRY_BASE_MS: z
+      .preprocess(parseNumber, z.number().int().min(50).default(200))
+      .default(200),
   })
   .superRefine((env, ctx) => {
     // Require TURSO_AUTH_TOKEN for remote libsql (non-file, non-localhost)
@@ -81,28 +121,52 @@ const raw = {
   VERCEL_ENV: process.env.VERCEL_ENV,
 
   GROQ_API_KEY: process.env.GROQ_API_KEY,
+
+  // optional providers
   JINA_API_KEY: process.env.JINA_API_KEY,
 
+  // Tavily
+  TAVILY_API_KEY: process.env.TAVILY_API_KEY,
+  TAVILY_SEARCH_DEPTH: process.env.TAVILY_SEARCH_DEPTH,
+  TAVILY_TOPIC: process.env.TAVILY_TOPIC,
+  TAVILY_COUNTRY: process.env.TAVILY_COUNTRY,
+
+  // Firecrawl
+  FIRECRAWL_API_KEY: process.env.FIRECRAWL_API_KEY,
+  FIRECRAWL_MAX_AGE_MS: process.env.FIRECRAWL_MAX_AGE_MS,
+  FIRECRAWL_COUNTRY: process.env.FIRECRAWL_COUNTRY,
+  FIRECRAWL_LANGS: process.env.FIRECRAWL_LANGS,
+
+  // Voyage
+  VOYAGE_API_KEY: process.env.VOYAGE_API_KEY,
+  VOYAGE_RERANK_MODEL: process.env.VOYAGE_RERANK_MODEL,
+
+  // Turso / libSQL
   TURSO_DATABASE_URL: process.env.TURSO_DATABASE_URL,
   TURSO_AUTH_TOKEN: process.env.TURSO_AUTH_TOKEN,
 
+  // Legacy Jina base
   JINA_SEARCH_BASE: process.env.JINA_SEARCH_BASE,
 
+  // App flags/limits
   LOG_LEVEL: process.env.LOG_LEVEL,
   ENABLE_RERANK: process.env.ENABLE_RERANK,
   REQUEST_TIMEOUT_MS: process.env.REQUEST_TIMEOUT_MS,
   MAX_SOURCES_INLINE: process.env.MAX_SOURCES_INLINE,
+
+  // DB health/retry knobs
+  DB_HEALTHCHECK_TIMEOUT_MS: process.env.DB_HEALTHCHECK_TIMEOUT_MS,
+  DB_MAX_RETRIES: process.env.DB_MAX_RETRIES,
+  DB_RETRY_BASE_MS: process.env.DB_RETRY_BASE_MS,
 };
 
 const parsed = ServerEnvSchema.safeParse(raw);
 
 if (!parsed.success) {
-  //   const format = parsed.error.format();
   const issues = parsed.error.issues
     .map((i) => `- ${i.path.join(".") || "(root)"}: ${i.message}`)
     .join("\n");
 
-  // Emit a concise but clear error; fail fast to avoid partial boot.
   console.error("Invalid environment configuration:\n" + issues);
   throw new Error("Environment validation failed. See logs for details.");
 }

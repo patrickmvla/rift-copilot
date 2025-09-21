@@ -8,6 +8,7 @@ import {
   type ResearchRequest,
 } from "@/features/research/types";
 import { deepResearch } from "@/features/research/server/deepresearch";
+import { dbHealthCheck } from "@/db/health";
 
 export const runtime = "nodejs";
 
@@ -39,6 +40,19 @@ export async function POST(req: NextRequest) {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
+  }
+
+  // DB preflight: fail fast if DB is unavailable so we don't stream a 200
+  try {
+    await dbHealthCheck();
+  } catch (e: any) {
+    logError(log, e, "DB health check failed");
+    return new Response(
+      JSON.stringify({
+        error: "Database unavailable. Please retry shortly.",
+      }),
+      { status: 503, headers: { "Content-Type": "application/json" } }
+    );
   }
 
   // SSE stream + orchestration
@@ -74,6 +88,7 @@ export async function POST(req: NextRequest) {
             case "claims":
             case "done":
             case "error":
+            case "answer": // forward full-answer event for non-streaming consumers
               emit(e as any);
               break;
             default:
@@ -113,8 +128,6 @@ function isAbort(err: unknown) {
       err !== null &&
       ("name" in err || "message" in err) &&
       ((err as any).name === "AbortError" ||
-        String((err as any).message || "")
-          .toLowerCase()
-          .includes("abort")))
+        String((err as any).message || "").toLowerCase().includes("abort")))
   );
 }

@@ -1,22 +1,34 @@
-"use client";
-
 import "@/styles/globals.css";
-import { useState } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { Metadata } from "next";
+import { MainHeader } from "@/components/MainHeader";
+import { Providers } from "../providers/providers";
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
-  const [queryClient] = useState(() => new QueryClient());
+export const metadata: Metadata = {
+  title: "Evidence-First Research",
+  description: "Deep research with verifiable citations and evidence.",
+};
 
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
       <body className="min-h-screen bg-background text-foreground antialiased">
-        <QueryClientProvider client={queryClient}>
+        {/* Skip to content */}
+        <a
+          href="#content"
+          className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 rounded bg-primary px-3 py-1 text-sm text-primary-foreground"
+        >
+          Skip to content
+        </a>
+
+        <Providers>
+          <MainHeader
+            // githubUrl="https://github.com/owner/repo"
+            // repoSlug="owner/repo"
+          />
+          {/* Anchor target for skip link; pages can still use their own <main> */}
+          <div id="content" />
           {children}
-        </QueryClientProvider>
+        </Providers>
       </body>
     </html>
   );
